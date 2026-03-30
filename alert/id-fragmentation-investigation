@@ -1,0 +1,194 @@
+
+---
+name: id-fragmentation-investigation
+description: |
+  用户ID割裂（ID Fragmentation）排查与分析。当用户提到以下情况时必须使用此skill：
+  - 用户ID不一致、用户割裂、ID绑定失败
+  - 用户表和事件表的#account_id、#distinct_id、#user_id绑定异常
+  - 用户在不同设备/账号间数据不贯通
+  - 排查用户身份识别问题
+  - 发现重复用户或幽灵用户
+  - 涉及双端上报（客户端+服务端）的数据一致性问题
+  - 涉及访客ID和账户ID的绑定逻辑
+  - 询问"为什么一个用户被识别成多个"
+  - Kafka数据入库顺序导致的数据割裂问题
+  此skill提供完整的排查流程、SQL模板和案例对照。
+---
+
+# ID 割裂排查 Skill
+
+## 概述
+
+用户ID割裂是指同一用户在事件表或用户表中被识别为多个独立用户（多个#user_id）的情况。本skill帮助快速定位割裂原因并给出解决方案。
+
+## 核心概念
+
+| 字段 | 说明 |
+|------|------|
+| `#account_id` | 账户ID（用户注册/登录时设置） |
+| `#distinct_id` | 访客ID（客户端生成，设备唯一） |
+| `#user_id` | 用户ID（TE系统生成，用于数据归属） |
+
+**关键规则**：`#account_id`、`#distinct_id`、`#user_id` 三者一一对应。
+
+## 割裂原因速查表
+
+### A. 双端上报场景（客户端+服务端）
+
+| 原因 | 特征 |
+|------|------|
+| 服务端上报的#distinct_id与客户端不一致 | 服务端和客户端的#distinct_id不同 |
+| 注册/登录时未携带#distinct_id | 首条带#account_id的事件#distinct_id为空 |
+| 用户表设置时未携带#distinct_id且先于事件表入库 | userset先入库，无#distinct_id |
+
+### B. 仅客户端上报场景
+
+| 原因 | 特征 |
+|------|------|
+| 注册/登录时未携带#distinct_id | 首条带#account_id的事件#distinct_id为空 |
+| 用户表设置时未携带#distinct_id且先于事件表入库 | userset先入库，无#distinct_id |
+
+## 排查步骤
+
+### 步骤1：检查用户表绑定情况
+
+```sql
+with t1 as (
+  -- 找出 aid 有值，但 did 无值的用户
+  select "#user_id", "#account_id", "#distinct_id", "#reg_time" 
+  from ta.v_user_项目ID
+  where "#account_id" is not null
+  and "#distinct_id" is null
+)
+, t2 as (
+  -- 找出 aid 无值，但 did 有值的用户
+  select "#user_id", "#account_id", "#distinct_id", "#reg_time" 
+  from ta.v_user_项目ID
+  where "#account_id" is null
+  and "#distinct_id" is not null
+)
+, t3 as (
+  -- 计算总体用户数
+  select count(1) as "uct" from ta.v_user_项目ID
+)
+
+SELECT 
+  uct as "总用户数",
+  "did缺失数",
+  "did缺失数"*1.0 / uct*1.0 as "did缺失占比",
+  "aid缺失数", 
+  "aid缺失数"*1.0 / uct*1.0 as "aid缺失占比"
+FROM 
+  (select count(1) as "did缺失数" from t1 ) as d1 
+  left join 
+  (select count(1) as "aid缺失数" from t2) as d2 on 1=1
+  left join t3 on 1=1
+```
+
+**解读**：
+- 案例3和案例5中，`#distinct_id`为空是正常现象
+- 其他场景的空值可能导致ID割裂
+
+### 步骤2：分析用户行为序列
+
+选取绑定异常的用户，查询其完整行为序列：
+
+```sql
+select "#user_id", "#account_id", "#distinct_id", "#event_name", "#event_time", 
+       "#server_time", "#data_source", "#zone_offset", "#ip" 
+from ta.v_event_项目ID
+where ("#distinct_id" = '目标distinct_id' or "#account_id" = '目标account_id')
+and ${PartDate:date1}
+```
+
+**观察要点**：
+- #distinct_id和#user_id都改变 → 案例8（双端distinct_id不一致）
+- 只有#user_id改变 → 案例2、4、6、7
+
+### 步骤3：查询Kafka入库顺序（如需）
+
+当步骤1和2无法确认问题时，查询Kafka中user_set/user_setOnce/track的入库顺序：
+
+```sql
+SELECT
+  "#data_source",
+  JSON_EXTRACT_SCALAR(str_json, '$._xxxxxtype') AS "#type",
+  JSON_EXTRACT_SCALAR(str_json, '$._xxxxxevent_name') AS "#event_name",
+  JSON_EXTRACT_SCALAR(str_json, '$._xxxxxaccount_id') AS "#account_id",
+  JSON_EXTRACT_SCALAR(str_json, '$._xxxxxdistinct_id') AS "#distinct_id",
+  CAST(JSON_EXTRACT_SCALAR(str_json, '$._xxxxxtime') AS TIMESTAMP) AS "#event_time",
+  "#server_time",
+  JSON_EXTRACT_SCALAR(str_json, '$.properties._xxxxxlib') AS "#lib",
+  JSON_EXTRACT_SCALAR(str_json, '$.properties._xxxxxlib_version') AS "#lib_version",
+  JSON_EXTRACT_SCALAR(str_json, '$._xxxxxuuid') AS "#uuid",
+  "#appid",
+  _partition_id,
+  _partition_offset
+FROM kafka.ta."ta-data"
+WHERE _timestamp ${Time:time1}
+  AND JSON_EXTRACT_SCALAR(_message, '$.appid') = '${appid}'
+  AND "_type" IN ('user_set', 'user_setOnce', 'track')
+ORDER BY "_server_time";
+```
+
+## 案例对照表
+
+| 案例 | 场景 | 特征 | 是否割裂 |
+|------|------|------|----------|
+| 1 | 新设备+注册携带distinct_id | 正常流程 | 否 |
+| 2 | 新设备+注册未携带distinct_id | 首条account_id事件无distinct_id | **是** |
+| 3 | 老机新账号 | 一个设备绑定多个账号，第二个账号的distinct_id为空 | 否（正常） |
+| 4 | 老机新账号+未携带distinct_id | 两个新账号都无distinct_id | **是** |
+| 5 | 新机老账号 | 换设备登录老账号，第二个设备distinct_id为空 | 否（正常） |
+| 6 | 新机老账号+未携带distinct_id | 登录时无distinct_id | **是** |
+| 7 | userset先入库且无distinct_id | 属性设置先于事件表入库 | **是** |
+| 8 | 双端distinct_id不一致 | 客户端和服务端distinct_id不同 | **是** |
+
+## 解决方案
+
+### 1. 双端上报场景
+
+- **服务端上报时必须带上客户端生成的#distinct_id**
+- 服务端在SDK初始化后获取客户端的#distinct_id，后续所有事件都携带
+
+### 2. 用户表设置
+
+- **每一条用户属性数据都必须携带#distinct_id**
+- 确保userset和track事件的入库顺序正确
+
+### 3. 历史数据修复
+
+- 联系客户成功经理协商修复方案
+
+## 上报注意事项
+
+1. **login方法**：客户端调用login设置#account_id，该方法不上报登录事件，仅让后续事件携带#account_id
+
+2. **服务端上报distinct_id**：客户端SDK初始化完成后将#distinct_id发送给服务端，服务端上报所有事件时带上
+
+3. **distinct_id设置时机**：如果自定义#distinct_id，必须在SDK初始化后立即设置，防止前后产生割裂
+
+4. **一一对应规则**：当未绑定#user_id的#account_id和已绑定#user_id的#distinct_id同时出现时，会生成新的#user_id
+
+5. **数据归属优先级**：当#account_id和#distinct_id对应不同#user_id时，数据归属于#account_id对应的#user_id
+
+## 快速诊断流程
+
+```
+用户报告ID割裂问题
+    │
+    ▼
+步骤1：运行用户表绑定检查SQL
+    │
+    ├── did缺失或aid缺失比例异常高 → 继续步骤2
+    └── 比例正常 → 可能是案例3/5的正常空值，无需处理
+    │
+    ▼
+步骤2：查询用户行为序列
+    │
+    ├── #distinct_id和#user_id都改变 → 案例8（双端不一致）
+    ├── 注册/登录时#distinct_id为空 → 案例2/4/6
+    └── userset先入库无distinct_id → 案例7
+    │
+    ▼
+确认问题类型 → 提供对应解决方案
