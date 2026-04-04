@@ -18,76 +18,22 @@ description:
 
 ```
 使用 AskUserQuestion 询问：
-
-2. 问题现象：
-   - 用户表中同一ID对应多个#user_id
+1.目前排查目的是什么？                                          
+选项A：目前未发现异常，想整体排查是否存在ID割裂问题         
+选项B：已经发现数据异常，需要排查具体问题
+  B1.继续提问，目前遇到的问题现象：
+   - 用户表中部分#user_id/#account_id，没有绑定#distinct_id
    - 事件表中同一用户行为分散在多个#user_id
-   - 登录后数据未与访客数据合并
-   - userset设置的属性未关联到正确用户
-3. 是否知道具体的项目ID和异常用户样本
+   - 登录后数据未与访客数据归属到同一个用户
+    - 更多，请详细描述
+  B2. 是否知道具体的异常用户的#account_id和#distinct_id,请提供
 ```
 
 根据回答，选择对应排查路径：
 
 ---
-## 排查路径
-step1: 查询事件表，#data_source的的分布情况，
-确认上报方式：仅客户端上报 / 客户端+服务端双端上报 / 仅服务端上报
-
-step2：
-### 排查路径 A：双端上报场景
-
-**适用条件**：客户端+服务端同时上报数据
-
-#### A1：检查双端distinct_id一致性
-
-```sql
--- 查找同一account_id下不同distinct_id的情况
-SELECT 
-  "#account_id",
-  "#distinct_id",
-  "#data_source",
-  COUNT(*) as event_count
-FROM ta.v_event_{project_id}
-WHERE "#account_id" IS NOT NULL AND "#account_id" != ''
-  AND "$part_date" BETWEEN '{开始日期}' AND '{结束日期}'
-GROUP BY "#account_id", "#distinct_id", "#data_source"
-HAVING COUNT(DISTINCT "#distinct_id") > 1
-ORDER BY event_count DESC
-LIMIT 50
-```
-
-**判断**：
-- 同一#account_id，客户端和服务端的#distinct_id不同 → **双端distinct_id不一致（割裂）**
-- 服务端事件#distinct_id为空 → **服务端未携带distinct_id（割裂）**
-
-#### A2：检查注册/登录事件
-
-```sql
--- 查找首条带account_id的事件（检查是否携带distinct_id）
-SELECT 
-  "#user_id",
-  "#account_id",
-  "#distinct_id",
-  "#event_name",
-  "#event_time",
-  "#data_source"
-FROM ta.v_event_{project_id}
-WHERE "#account_id" = '{目标account_id}'
-  AND "$part_date" BETWEEN '{开始日期}' AND '{结束日期}'
-ORDER BY "#event_time"
-LIMIT 10
-```
-
-**判断**：首条带#account_id事件的#distinct_id为空 → **注册未携带distinct_id**
-
----
-
-### 排查路径 B：仅客户端上报场景
-
-**适用条件**：只有客户端SDK上报数据
-
-### B1：检查用户表绑定情况
+## 排查路径 A
+step1: 查询user表，检查用户表绑定情况
 
 ```sql
 -- 检查用户表中distinct_id/account_id空值比例
@@ -99,50 +45,47 @@ SELECT
 FROM ta.v_user_{project_id}
 ```
 
-**判断**：#distinct_id空值比例 > 10% → 需排查userset入库问题
+**判断**：#distinct_id空值比例 > 10% ->可能存在异常，需进一步排查。#distinct_id空值率=0，不存在ID割裂；#distinct_id空值率>0,这一步不给是否割裂的结论，均需进一步排查.
 
-### B2：查找割裂样本
 
+
+step2: 查询事件表，确认所有事件数据中#data_source的的分布情况，
+确认上报方式：仅客户端上报 / 客户端+服务端双端上报 / 仅服务端上报
+
+step3：
+### 排查路径
+
+#### A1：检查是否上报注册事件，若有则使用注册事件进行以下步骤排查，若无则使用登录事件。
+检查step1中#account_id有值但#distinct_id无值的用户，注册（登录）事件中#distinct_id是否有值。
 ```sql
--- 查找同一account_id对应多个user_id
-SELECT "#account_id", COUNT(DISTINCT "#user_id") as user_count,
-       ARRAY_AGG(DISTINCT "#user_id") as user_ids
-FROM ta.v_user_{project_id}
-WHERE "#account_id" IS NOT NULL AND "#account_id" != ''
-GROUP BY "#account_id"
-HAVING COUNT(DISTINCT "#user_id") > 1
-ORDER BY user_count DESC
-LIMIT 20
-```
-
----
-
-### 排查路径 C：userset入库问题
-
-**适用条件**：用户反映用户属性设置异常或绑定失败
-
-#### C1：检查userset携带distinct_id情况
-
-```sql
--- 查找userset事件中distinct_id为空的情况
+-- 查找首条带#account_id的事件（检查是否携带#distinct_id）
 SELECT 
+  "#user_id",
   "#account_id",
   "#distinct_id",
   "#event_name",
   "#event_time",
   "#data_source"
-FROM ta.v_event_{project_id}
-WHERE "#event_name" LIKE '%user_set%' OR "#event_name" LIKE '%user_setOnce%'
+FROM ta.v_event_{project_id} 
+WHERE "#account_id" = '{目标account_id}'
+ AND ("$part_event" LIKE '%register%' OR "$part_event" LIKE '%login%')
   AND "$part_date" BETWEEN '{开始日期}' AND '{结束日期}'
-  AND ("#distinct_id" IS NULL OR "#distinct_id" = '')
 ORDER BY "#event_time"
-LIMIT 50
+
 ```
+**依次判断**：
+-1.若注册（登录）事件的#distinct_id全都无值，
+  1.1大概率会导致ID割裂，除非注册（登录）时userset的#account_id和#distinct_id一起出现并先于注册（登录）事件先入库；
+  → **注册（登录）未携带distinct_id（割裂）**
 
-**判断**：userset事件#distinct_id为空 → **userset未携带distinct_id**
+-2.若注册（登录）事件，#distinct_id有值。
+ 2.1 但用户注册/登录后的5分钟内，#distinct_id分别在客户端和服务端事件数据中，是两个不一样的值。 同一#account_id，客户端和服务端的#distinct_id不同； 
+  → **双端distinct_id不一致（割裂）**
 
-#### C2：检查入库顺序（Kafka）
+--2.2 查询该#distinct_id在user表中已经与别的#account_id和#user_id绑定了，并且该#user_id注册时间早于该#account_id；
+  → **#distinct_id已于老#account_id绑定，老设备注册新账号（正常）**
 
+--2.3 #distinct_id在user表中没有与别的#account_id绑定,则排查注册（登录）userset时#distinct_id无值。
 ```sql
 SELECT 
   "#data_source",
@@ -153,86 +96,92 @@ SELECT
 FROM kafka.ta.ta-data
 WHERE _timestamp BETWEEN TIMESTAMP '{开始时间}' AND TIMESTAMP '{结束时间}'
   AND JSON_EXTRACT_SCALAR(str_json, '$._xxxxxaccount_id') = '{目标account_id}'
-  AND JSON_EXTRACT_SCALAR(str_json, '$._xxxxxtype') IN ('user_set', 'user_setOnce', 'track')
+  AND JSON_EXTRACT_SCALAR(str_json, '$._xxxxxtype') IN ('user_set', 'user_setOnce')
 ORDER BY "#server_time"
 LIMIT 100
 ```
+  →**判断**：userset未携带#distinct_id → **userset未携带先于注册（登录）事件入库，导致id割裂（割裂）**
 
-**判断**：userset入库时间早于track，且userset无#distinct_id → **入库顺序问题**
 
 ---
 
-### 排查路径 E：已知ID查割裂
+### 排查路径 B：已知ID查割裂
 
 **适用条件**：用户提供#account_id或#distinct_id，需要判断是否存在ID割裂
 
 **核心原理**：
 - TE用户表中，#user_id与#account_id、#user_id与#distinct_id都是**一一对应**关系，用户表中不会出现"一个ID对应多个#user_id"的情况
-- **割裂的本质**：account_id和distinct_id在入库时未能正确绑定（绑定时机不对），导致分别生成了不同的#user_id
-- **割裂的表现**：**事件表中**同一个#account_id（或#distinct_id）的事件分散在多个不同的#user_id下
+- **割裂的本质**：account_id和distinct_id在入库时未能正确绑定，导致分别生成了不同的#user_id
+- **割裂的表现**：**事件表中**同一个用户的事件分散在多个不同的#user_id下
 
 ---
 
-#### E1：检查事件表中user_id分布（判断是否割裂）
+#### B1：用户仅提供了#account_id，查询该#account_id的事件数据
+-注册事件/首条登录事件，#distinct_id为空。->确认割裂，注册/登录事件未上报#distinct_id导致的ID割裂
+-注册事件/首条登录事件，#distinct_id有值。
+ --查询#distinct_id的用户表数据，#distinct_id在user表中已经与别的#account_id绑定了。->正常。老设备注册新账号，不算割裂。
 
-**目的**：查看该ID的事件是否分散在多个#user_id下，这是割裂的直接表现
 
-```sql
--- 已知account_id，查询其事件分布到多少个user_id
-SELECT 
-  "#user_id",
-  "#distinct_id",
-  COUNT(*) as event_count,
-  MIN("#event_time") as first_event,
-  MAX("#event_time") as last_event
-FROM ta.v_event_{project_id}
-WHERE "#account_id" = '{目标account_id}'
-  AND "$part_date" BETWEEN '{开始日期}' AND '{结束日期}'
-GROUP BY "#user_id", "#distinct_id"
-ORDER BY first_event
+#### B2：用户仅提供了#distinct_id，查询该#distinct_id的事件数据和用户表数据
 
--- 已知distinct_id，查询其事件分布到多少个user_id
-SELECT 
-  "#user_id",
-  "#account_id",
-  COUNT(*) as event_count,
-  MIN("#event_time") as first_event,
-  MAX("#event_time") as last_event
-FROM ta.v_event_{project_id}
-WHERE "#distinct_id" = '{目标distinct_id}'
-  AND "$part_date" BETWEEN '{开始日期}' AND '{结束日期}'
-GROUP BY "#user_id", "#account_id"
-ORDER BY first_event
-```
+**目的**：查看该distinct_id的事件是否分散在多个#user_id下，以及确认用户表中与之绑定的#account_id和#user_id
 
 **判断规则**：
 
 | 结果 | 判断 |
 |----------|------|
-| 只有1个#user_id | **正常**：该ID所有事件归属同一用户，无割裂 |
-| 有多个#user_id | **割裂**：该ID的事件分散在多个用户下，需执行E2分析原因 |
+| 事件表中只有1个#user_id | **正常**：该ID所有事件归属同一用户，无割裂 |
+| 事件中有多个#user_id，但是#distinct_id在用户表中与其他#account_id绑定 | **正常**：该ID的事件分散在多个用户下，但是绑定的是最早注册的#account_id |
+| 事件中有多个#user_id，但是#distinct_id在用户表中未与其他#account_id绑定 | **割裂**：该ID的事件分散在多个用户下，可能是因为注册时未上报#distinct_id |
 
 ---
 
-#### E2：分析事件序列定位割裂原因
+#### 用户同时提供了#distinct_id 和 #account_id
 
-**目的**：当E1发现多个#user_id时，分析事件序列找出割裂发生的时机和原因
+直接查询该用户的行为序列：
 
 ```sql
--- 查询完整事件序列
 SELECT 
-  "#event_time",
   "#user_id",
   "#account_id",
   "#distinct_id",
   "#event_name",
+  "#event_time",
+  "#device_id",
   "#data_source"
 FROM ta.v_event_{project_id}
-WHERE "#account_id" = '{目标account_id}'  -- 或 "#distinct_id" = '{目标distinct_id}'
+WHERE 
+  ("#distinct_id" = '{目标distinct_id}' OR "#account_id" = '{目标account_id}')
   AND "$part_date" BETWEEN '{开始日期}' AND '{结束日期}'
 ORDER BY "#event_time"
 LIMIT 100
 ```
+**判断规则**：
+
+| 结果 | 判断 |
+|----------|------|
+| #distinct_id 和 #account_id 分别对应两个#user_id，且#account_id在用户表中与别的#distinct_id绑定 | **正常**：新设备登录老号，登录后行为归属老账号 |
+| #distinct_id 和 #account_id 分别对应两个#user_id，且#account_id在用户表中未与别的#distinct_id，#distinct_id在用户表中也未与其他#account_id绑定 | **割裂**：注册时/登录时，未成功绑定#account_id和#distinct_id |
+|  #distinct_id 和 #account_id 分别对应两个#user_id，#distinct_id在用户表中已与其他#account_id绑定 | **正常**：老设备注册新账号 |
+
+
+---
+
+#### b3：检查用户表绑定关系（辅助确认）
+
+**目的**：查看割裂后各user_id的最终绑定状态
+
+```sql
+SELECT "#user_id", "#account_id", "#distinct_id"
+FROM ta.v_user_{project_id}
+WHERE "#user_id" IN ({E1查出的多个user_id})
+```
+
+**说明**：用户表反映最终绑定关系。割裂场景中：
+- 注册未带distinct_id：u2的#distinct_id为空
+- 双端不一致：u1和u2分别绑定了不同的distinct_id
+
+----
 
 **对照典型割裂场景判断原因**：
 
@@ -250,70 +199,11 @@ LIMIT 100
 | 新机老账号 | (a1,d1,u1) → (null,d2,u2) → (a1,d2,u1) | 老账号a1在新设备d2登录，d2绑定到a1的u1 |
 | 老机新账号 | (a1,d1,u1) → (a2,d1,u2) | d1已绑定a1，新账号a2无法再绑定d1，新建u2（正常） |
 
----
 
-#### E3：检查用户表绑定关系（辅助确认）
-
-**目的**：查看割裂后各user_id的最终绑定状态
-
-```sql
-SELECT "#user_id", "#account_id", "#distinct_id"
-FROM ta.v_user_{project_id}
-WHERE "#user_id" IN ({E1查出的多个user_id})
-```
-
-**说明**：用户表反映最终绑定关系。割裂场景中：
-- 注册未带distinct_id：u2的#distinct_id为空
-- 双端不一致：u1和u2分别绑定了不同的distinct_id
 
 ---
 
-#### 执行流程
 
-```
-已知account_id或distinct_id
-    │
-    ▼
-E1：查事件表user_id分布
-    │
-    ├─ 只有1个user_id → 正常，无割裂
-    │
-    └─ 有多个user_id → 割裂！执行E2
-         │
-         ▼
-    E2：分析事件序列，对照典型割裂场景
-         │
-         ├─ (null,d1,u1) → (a1,null,u2) → 注册未携带distinct_id
-         ├─ userset(a1,null)早于track → userset入库顺序问题
-         └─ d1→d2变化 → 双端distinct_id不一致
-         │
-         ▼
-    E3（可选）：查用户表确认绑定状态
-```
-
----
-
-### 排查路径 D：已知具体异常用户
-
-**适用条件**：用户提供了具体的#user_id/#account_id/#distinct_id，需要分析完整行为序列
-
-直接查询该用户的行为序列：
-
-```sql
-SELECT 
-  "#user_id",
-  "#account_id",
-  "#distinct_id",
-  "#event_name",
-  "#event_time",
-  "#data_source"
-FROM ta.v_event_{project_id}
-WHERE 
-  ("#distinct_id" = '{目标distinct_id}' OR "#account_id" = '{目标account_id}')
-  AND "$part_date" BETWEEN '{开始日期}' AND '{结束日期}'
-ORDER BY "#event_time"
-LIMIT 100
-```
 
 **对照典型场景表判断**：
 
@@ -347,7 +237,6 @@ LIMIT 100
 | 双端distinct_id不一致 | 服务端上报必须携带客户端#distinct_id |
 | 注册未带distinct_id | 确保login()调用时SDK已初始化 |
 | userset未带distinct_id | 确保userset调用携带distinct_id |
-| userset入库顺序问题 | 调整上报顺序，track先于userset |
 | 历史数据修复 | 联系客户成功经理 |
 
 ---
@@ -360,40 +249,6 @@ LIMIT 100
   "modelType": "sql",
   "qp": "{\"eventView\":{},\"events\":{\"sql\":\"SELECT ... FROM ta.v_user_{project_id} ...\"}}"
 }
-```
-
----
-
-## 排查流程图
-
-```
-开始排查
-    │
-    ▼
-询问上报方式和已知信息 ────────────────────────┐
-    │                                          │
-    ├─ 已知account_id/distinct_id → 路径E：查ID割裂
-    │     │
-    │     ├─ E1查事件表user_id分布 → 只有1个 → 正常
-    │     └─ E1查事件表user_id分布 → 多个 → 割裂！
-    │            │
-    │            ▼
-    │       E2分析事件序列 → 定位割裂原因
-    │
-    ├─ 双端上报 → 路径A：检查distinct_id一致性
-    │              │
-    │              ├─ 不一致 → 服务端需携带客户端distinct_id
-    │              └─ 为空 → 服务端未携带distinct_id
-    │
-    ├─ 仅客户端 → 路径B：检查用户表绑定
-    │              │
-    │              ├─ 空值比例高 → 路径C：检查userset
-    │              └─ 查找割裂样本 → 分析行为序列
-    │
-    └─ 已知异常用户 → 路径D：直接查行为序列
-    │
-    ▼
-对照典型场景表 → 给出解决方案
 ```
 
 ---
